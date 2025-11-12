@@ -1,0 +1,4 @@
+geomloss
+sentence_transformers
+pykeops
+torch
