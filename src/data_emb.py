@@ -1,168 +1,211 @@
-from multiprocessing import Process, Queue, Pool
-import queue
-import threading
-from typing import List, Dict
-import time
-from sentence_transformers import SentenceTransformer
 import json
-from torch.utils.data import Dataset, DataLoader
-import tqdm
 import os
 import torch
+import tqdm
+from typing import List, Dict, Any, Optional
+from torch.utils.data import Dataset, DataLoader
+from sentence_transformers import SentenceTransformer
 
-NUM_TOKENIZER_WORKERS = 16  # Set the number of tokenizer worker processes
-chunk_num = 8
+
+def _read_last_complete_jsonl_line(path: str, max_read_bytes: int = 1024 * 1024) -> Optional[str]:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+
+    size = os.path.getsize(path)
+    read_size = min(size, max_read_bytes)
+
+    with open(path, "rb") as f:
+        f.seek(size - read_size)
+        data = f.read(read_size)
+
+    first_nl = data.find(b"\n")
+    if first_nl != -1 and size > read_size:
+        data = data[first_nl + 1 :]
+
+    lines = data.split(b"\n")
+
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i].strip()
+        if not line:
+            continue
+        try:
+            line_str = line.decode("utf-8")
+            json.loads(line_str)
+            return line_str
+        except Exception:
+            continue
+
+    return None
+
+
+def get_last_done_index_and_fix_file(path: str) -> int:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return 0
+
+    last_line = _read_last_complete_jsonl_line(path)
+    if last_line is None:
+        with open(path, "wb") as f:
+            f.truncate(0)
+        return 0
+
+    last_obj = json.loads(last_line)
+    last_idx = int(last_obj["index"])
+
+    size = os.path.getsize(path)
+    read_size = min(size, 1024 * 1024)
+
+    with open(path, "rb") as f:
+        f.seek(size - read_size)
+        data = f.read(read_size)
+
+    last_bytes = (last_line + "\n").encode("utf-8")
+    pos = data.rfind(last_bytes)
+    if pos != -1:
+        start_of_chunk = size - read_size
+        truncate_pos = start_of_chunk + pos + len(last_bytes)
+        with open(path, "rb+") as f:
+            f.truncate(truncate_pos)
+
+    return last_idx
 
 
 class SentenceDataset(Dataset):
-    def __init__(self, data_path):
-        self.sentences = []
-        num = 0
-        with open(data_path, 'r') as file:
-            for line in file:
-                num += 1
-                jsonline = json.loads(line)
-                if 'text' in jsonline:
-                    item = {'index': num, 'text': jsonline["text"]}
-                else:
-                    item = {'index': num, 'text': jsonline['problem'] + jsonline['deepseek_reasoning'] + jsonline['deepseek_solution']}
-                self.sentences.append(item)
+    def __init__(self, data_path: str, start_index: int = 1):
+        self.data_path = data_path
+        self.offsets: List[int] = []
+        self._build_offsets()
+
+
+        self.start_pos = max(0, start_index - 1)
+
+    def _build_offsets(self):
+        offset = 0
+        with open(self.data_path, "rb") as f:
+            for line in f:
+                self.offsets.append(offset)
+                offset += len(line)
 
     def __len__(self):
-        return len(self.sentences)
+        return max(0, len(self.offsets) - self.start_pos)
 
-    def __getitem__(self, idx):
-        return self.sentences[idx]
-    
+    def __getitem__(self, i: int) -> Dict[str, Any]:
+        real_idx = self.start_pos + i 
+        with open(self.data_path, "rb") as f:
+            f.seek(self.offsets[real_idx])
+            line = f.readline().decode("utf-8")
 
-class TokenizerWorker(Process):
-    def __init__(self, worker_id: int, input_queue: Queue, output_queue: Queue, tokenizer):
-        super().__init__()
-        self.worker_id = worker_id
-        self.input_queue = input_queue
-        self.output_queue = output_queue
-        self.tokenizer = tokenizer
-        self.chunk_num = 4
+        obj = json.loads(line)
+        if "text" in obj:
+            text = obj["text"]
+        else:
+            text = str(obj.get("prompt", "")) + str(obj.get("response", ""))
 
-    def run(self):
-        while True:
-            try:
-                batch = self.input_queue.get(timeout=60)
-                if batch is None:  # Stop signal
-                    break
+        return {"index": real_idx + 1, "text": text} 
 
-                texts = batch['text']
-                indices = [idx.item() if torch.is_tensor(idx) else idx for idx in batch['index']]
 
-                all_chunked_texts = []
-                all_chunk_indices = []
+# =====================
+# Worker-local tokenizer
+# =====================
+_WORKER_TOKENIZER = None
 
-                # Tokenize and split texts into chunks
-                for i, text in enumerate(texts):
-                    tokens = self.tokenizer.tokenize(text)
-                    step_size = len(tokens) // self.chunk_num if len(tokens) >= self.chunk_num else 1  # Evenly split into 8 chunks
+def _get_worker_tokenizer(model: SentenceTransformer):
+    global _WORKER_TOKENIZER
+    if _WORKER_TOKENIZER is None:
+        _WORKER_TOKENIZER = model.tokenizer
+    return _WORKER_TOKENIZER
 
-                    chunked_texts = [self.tokenizer.convert_tokens_to_string(tokens[j * step_size: (j + 1) * step_size]) for j in range(self.chunk_num) if len(tokens[j * step_size: (j + 1) * step_size]) > 0]
 
-                    all_chunked_texts.extend(chunked_texts)
-                    all_chunk_indices.extend([indices[i]] * len(chunked_texts))
+def make_collate_fn(model: SentenceTransformer, chunk_num: int):
+    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        tokenizer = _get_worker_tokenizer(model)
 
-                self.output_queue.put({
-                    'chunked_texts': all_chunked_texts,
-                    'chunk_indices': all_chunk_indices
-                })
+        all_chunked_texts: List[str] = []
+        all_chunk_indices: List[int] = []
 
-            except queue.Empty:
+        for item in batch:
+            idx = int(item["index"])
+            text = item["text"]
+
+            tokens = tokenizer.tokenize(text)
+            if not tokens:
                 continue
 
+            step_size = len(tokens) // chunk_num if len(tokens) >= chunk_num else 1
 
-def embeder(model, data_path, save_path):
+            for j in range(chunk_num):
+                start = j * step_size
+                end = (j + 1) * step_size
+                if start >= len(tokens):
+                    break
+                chunk_tokens = tokens[start:end]
+                if not chunk_tokens:
+                    continue
+                chunk_text = tokenizer.convert_tokens_to_string(chunk_tokens)
+                if chunk_text.strip():
+                    all_chunked_texts.append(chunk_text)
+                    all_chunk_indices.append(idx)
 
-    dataset = SentenceDataset(data_path)
-    dataloader = DataLoader(dataset, batch_size=2000, shuffle=False)
+        return {"chunked_texts": all_chunked_texts, "chunk_indices": all_chunk_indices}
 
-    # Create queues and multiple worker processes
-    input_queue = Queue(maxsize=100)
-    output_queue = Queue(maxsize=100)
-    
-    # Create a thread to feed data into the queue
-    def fill_queue():
-        try:
+    return collate_fn
+
+
+def embeder(
+    model: SentenceTransformer,
+    data_path: str,
+    save_path: str,
+    batch_size: int,
+    chunk_num: int,
+    num_workers: int = 16,
+    resume: bool = True,
+):
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    last_done = 0
+    if resume and os.path.exists(save_path):
+        last_done = get_last_done_index_and_fix_file(save_path)
+
+    start_index = last_done + 1
+    dataset = SentenceDataset(data_path, start_index=start_index)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=make_collate_fn(model, chunk_num),
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+    mode = "a" if (resume and last_done > 0) else "w"
+    with open(save_path, mode, encoding="utf-8") as f_out:
+        with tqdm.tqdm(total=len(dataloader), desc=f"Embedding (start={start_index})") as pbar:
             for batch in dataloader:
-                # Convert tensor to normal Python types
-                if 'text' in batch:
-                    batch_dict = {
-                        'text': batch['text'],
-                        'index': [idx.item() if torch.is_tensor(idx) else idx for idx in batch['index']]
-                    }
-                input_queue.put(batch_dict)
-            # Send a termination signal to each worker
-            for _ in range(NUM_TOKENIZER_WORKERS):
-                input_queue.put(None)
-        except Exception as e:
-            print(f"Error in fill_queue: {e}")
+                chunked_texts = batch["chunked_texts"]
+                chunk_indices = batch["chunk_indices"]
 
-    fill_thread = threading.Thread(target=fill_queue)
-    fill_thread.start()
-    
-    workers = []
-    for i in range(NUM_TOKENIZER_WORKERS):
-        worker = TokenizerWorker(i, input_queue, output_queue, model.tokenizer)
-        worker.start()
-        workers.append(worker)
+                if not chunked_texts:
+                    pbar.update(1)
+                    continue
 
-    # Main process handles the results
-    encoded_sentences = {}
-    processed_batches = 0
-    total_batches = len(dataloader)
-    with tqdm.tqdm(total=total_batches) as pbar:
-        while processed_batches < total_batches:
-            try:
-                result = output_queue.get(timeout=300)  # Increase timeout to 5 minutes
+                embeddings = model.encode(
+                    chunked_texts,
+                    batch_size=len(chunked_texts),
+                    convert_to_tensor=True,
+                    normalize_embeddings=True,
+                )
 
-                all_chunked_texts = result['chunked_texts']
-                all_chunk_indices = result['chunk_indices']
+                per_sent: Dict[int, List[torch.Tensor]] = {}
+                for idx, emb in zip(chunk_indices, embeddings):
+                    per_sent.setdefault(int(idx), []).append(emb)
 
-                # Encoding process
-                if all_chunked_texts:
-                    embeddings = model.encode(
-                        all_chunked_texts,
-                        batch_size=len(all_chunked_texts),
-                        convert_to_tensor=True,
-                        normalize_embeddings=True
-                    )
-                    sentence_embeddings = {}
-                    # Aggregate embeddings of the same sentence
-                    for idx, embedding in zip(all_chunk_indices, embeddings):
-                        idx_key = idx if isinstance(idx, int) else idx.item()
-                        if idx_key not in sentence_embeddings:
-                            sentence_embeddings[idx_key] = []
-                        sentence_embeddings[idx_key].append(embedding)
-                                
-                    # Use index as key when storing
-                    for idx, emb_list in sentence_embeddings.items():
-                        avg_embedding = torch.mean(torch.stack(emb_list), dim=0)
-                        encoded_sentences[idx] = avg_embedding.tolist()
+                for idx in sorted(per_sent.keys()):
+                    avg_emb = torch.mean(torch.stack(per_sent[idx], dim=0), dim=0)
+                    f_out.write(json.dumps({"index": idx, "embedding": avg_emb.tolist()}, ensure_ascii=False) + "\n")
 
-                processed_batches += 1
                 pbar.update(1)
 
-            except queue.Empty:
-                print("Timeout waiting for results. Check if worker is still processing.")
-                continue
-            except Exception as e:
-                print(f"Error processing batch: {e}")
-                continue
-
-    # Clear CUDA cache
     torch.cuda.empty_cache()
-    with open(save_path, 'w', encoding='utf-8') as f:
-        for idx in sorted(encoded_sentences.keys()):  # Numeric sorting is fast
-            json_line = json.dumps({
-                'index': idx, 
-                'embedding': encoded_sentences[idx]
-            }, ensure_ascii=False)
-            f.write(json_line + '\n')
-            
-# if __name__ == "__main__":
-#     embeder(model, data_path, result_path)
+
