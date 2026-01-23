@@ -2,6 +2,8 @@
 <h1 align="center">Difficulty Is Not Enough: Curriculum Learning for LLMs Fine-tuning Must Consider Utility</h1>
 <div align="center"> 
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?logo=arxiv)](https://github.com/Jiangzs1028/DUCL/blob/main/paper/paper.pdf)
+
 </div>
 
 # Introduction
